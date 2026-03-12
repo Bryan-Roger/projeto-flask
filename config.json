@@ -1,0 +1,13 @@
+{
+  "output_mode": "decklink",
+  "video_screen": 1,
+  "audio_device": "",
+  "audio_name": "Padr\u00e3o do sistema",
+  "video_screen_name": "Monitor 2 \u2014 \\\\.\\DISPLAY2 1920\u00d71080 @ 1920,31",
+  "slate_enabled": true,
+  "slate_type": "video",
+  "slate_path": "Z:/0-VINHETAS ASSINATURAS NOVA/LOGO TV - 1H.mp4",
+  "playlist_loop": false,
+  "autoplay": false,
+  "volume": 80
+}
