@@ -10,7 +10,7 @@ Duas janelas:
 Motor DeckLink: lazy-init (só abre quando reproduz, libera ao parar)
 """
 
-import sys, os, json, subprocess
+import sys, os, json, subprocess, re, time
 from pathlib import Path
 from datetime import datetime
 from enum import Enum, auto
@@ -290,6 +290,82 @@ class SysMonWorker(QThread):
             return -1.0
 
 
+class AudioLevelWorker(QThread):
+    """Lê nível de áudio real via FFmpeg (astats) e emite 0..100."""
+    levelChanged = pyqtSignal(int)
+
+    _RE_DB = re.compile(r'(?:RMS level dB|Peak level dB|lavfi\.astats\.Overall\.(?:RMS_level|Peak_level))\s*[:=]\s*(-?\d+(?:\.\d+)?|-inf)', re.IGNORECASE)
+
+    def __init__(self, source: str):
+        super().__init__()
+        self._source = source
+        self._proc = None
+
+    def stop(self):
+        self.requestInterruption()
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self.wait(1000)
+
+    def _db_to_percent(self, db_text: str) -> int:
+        try:
+            db = float(db_text)
+        except ValueError:
+            return 0
+        # Faixa útil típica para VU: -60dB..0dB
+        db = max(-60.0, min(0.0, db))
+        return int(((db + 60.0) / 60.0) * 100.0)
+
+    def run(self):
+        fl = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        cmd = [
+            'ffmpeg', '-hide_banner', '-nostats', '-i', self._source,
+            '-vn', '-af',
+            'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+            '-f', 'null', '-'
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                creationflags=fl,
+            )
+        except Exception:
+            self.levelChanged.emit(0)
+            return
+
+        last_emit = 0.0
+        last_level = 0
+        try:
+            while not self.isInterruptionRequested() and self._proc and self._proc.poll() is None:
+                line = self._proc.stderr.readline()
+                if not line:
+                    break
+                m = self._RE_DB.search(line)
+                if not m:
+                    continue
+                level = self._db_to_percent(m.group(1))
+                now = time.monotonic()
+                if level != last_level or (now - last_emit) >= 0.033:
+                    last_level = level
+                    last_emit = now
+                    self.levelChanged.emit(level)
+        finally:
+            if self._proc and self._proc.poll() is None:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+            self.levelChanged.emit(0)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENGINE BRIDGE + PLAYER ENGINE  (lazy DeckLink init)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -302,6 +378,7 @@ class PlayerEngine(QObject):
     sig_ended    = pyqtSignal()
     sig_error    = pyqtSignal(str)
     sig_position = pyqtSignal(float)
+    sig_audio_level = pyqtSignal(int)
 
     def __init__(self, preview_widget=None):
         super().__init__()
@@ -325,6 +402,7 @@ class PlayerEngine(QObject):
         self._pause_timer  = QTimer()
         self._pause_timer.setSingleShot(True)
         self._pause_timer.timeout.connect(lambda: self._br.ended.emit())
+        self._audio_worker = None
         self._init_vlc()
 
     def set_preview(self, widget):
@@ -358,6 +436,24 @@ class PlayerEngine(QObject):
             self._br.error.emit(f'DeckLink: {e}')
             self._dk = None; return False
 
+    def _start_audio_monitor(self, source: str):
+        self._stop_audio_monitor()
+        self.sig_audio_level.emit(0)
+        if not source:
+            return
+        self._audio_worker = AudioLevelWorker(source)
+        self._audio_worker.levelChanged.connect(self.sig_audio_level, Qt.QueuedConnection)
+        self._audio_worker.start()
+
+    def _stop_audio_monitor(self):
+        if self._audio_worker:
+            try:
+                self._audio_worker.stop()
+            except Exception:
+                pass
+            self._audio_worker = None
+        self.sig_audio_level.emit(0)
+
     def play(self, item: 'PlaylistItem'):
         self.stop_slate()
         if item.type == ItemType.PAUSE:
@@ -378,6 +474,7 @@ class PlayerEngine(QObject):
                 self._dk.set_volume(self._volume)
             except Exception as e:
                 self._br.error.emit(str(e)); return
+        self._start_audio_monitor(url)
         if self._vlc_player:
             try:
                 m = self._vlc_inst.media_new(url)
@@ -391,6 +488,7 @@ class PlayerEngine(QObject):
 
     def _play_pause_item(self, item: 'PlaylistItem'):
         """Item de pausa: aguarda N segundos, exibe slate e emite sig_ended."""
+        self._stop_audio_monitor()
         ms = max(100, int(item.pause_dur * 1000))
         self._pause_timer.start(ms)
         self._pos_timer.start()
@@ -405,6 +503,7 @@ class PlayerEngine(QObject):
                 self._dk.set_volume(self._volume)
             except Exception as e:
                 self._br.error.emit(str(e)); return
+        self._start_audio_monitor(fp)
         if self._vlc_player:
             try:
                 m = self._vlc_inst.media_new(fp)
@@ -475,6 +574,7 @@ class PlayerEngine(QObject):
             self._slate_loop = False
 
     def stop_slate(self):
+        self._stop_audio_monitor()
         if not self._slate_active: return
         self._slate_active = False
         self._slate_loop   = False
@@ -490,6 +590,7 @@ class PlayerEngine(QObject):
             except Exception: pass
 
     def stop(self):
+        self._stop_audio_monitor()
         self._pos_timer.stop()
         self._pause_timer.stop()
         self._slate_loop = False
@@ -514,6 +615,7 @@ class PlayerEngine(QObject):
         return 0.0
 
     def destroy(self):
+        self._stop_audio_monitor()
         self._pos_timer.stop()
         self._pause_timer.stop()
         if self._dk:
@@ -1139,25 +1241,6 @@ class PlayerWindow(QMainWindow):
 
     request_output_config = pyqtSignal()
     request_output_stream = pyqtSignal()
-    def _update_vu(self):
-        try:
-            if not hasattr(self._engine, "_player"):
-                return
-
-            p = self._engine._player
-
-            if p is None:
-                return
-
-            # volume atual
-            vol = p.audio_get_volume()
-
-            if vol >= 0:
-                self._vu.setLevel(vol)
-
-        except:
-            pass
-
     def __init__(self, engine: PlayerEngine, model: PlaylistModel):
         super().__init__()
         self.setWindowTitle('TVV Playout — Player')
@@ -1171,11 +1254,8 @@ class PlayerWindow(QMainWindow):
         self._elapsed_list = 0.0
 
         self._build_ui()
-        self._vu_timer = QTimer()
-        self._vu_timer.setInterval(50)
-        self._vu_timer.timeout.connect(self._update_vu)
-        self._vu_timer.start()
         self._engine.sig_position.connect(self._on_position)
+        self._engine.sig_audio_level.connect(self._vu.setLevel)
         self._engine.sig_ended.connect(self._on_ended)
         self._engine.sig_error.connect(self._on_error)
 
@@ -1441,9 +1521,6 @@ class PlayerWindow(QMainWindow):
     def _on_volume(self, v: int):
         self._lbl_vol_pct.setText(f'{v}%')
         self._lbl_vol_dial.setText(f'{v}%')
-
-        # atualiza VU meter
-        self._vu.setLevel(v)
 
         # envia volume para engine
         self._engine.set_volume(v)
